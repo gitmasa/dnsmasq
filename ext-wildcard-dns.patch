@@ -1,0 +1,199 @@
+diff -Naur /original/dnsmasq-2.80/dnsmasq.conf.example /gitmasa/dnsmasq/dnsmasq.conf.example
+--- /original/dnsmasq-2.80/dnsmasq.conf.example	2018-10-19 03:21:55.000000000 +0900
++++ /gitmasa/dnsmasq/dnsmasq.conf.example	2019-02-07 18:25:08.940611461 +0900
+@@ -677,3 +677,12 @@
+ # This fixes a security hole. see CERT Vulnerability VU#598349
+ #dhcp-name-match=set:wpad-ignore,wpad
+ #dhcp-ignore-names=tag:wpad-ignore
++
++# If you create `wildcard dns` like xip.io, set baseDomain to wildcard-domain.
++# When it set, you can access A records below.
++#
++# ex1: 'http-192.168.0.1.expample.com' to 192.168.0.1
++# ex2: 'http-192_168_0_1.expample.com' to 192.168.0.1
++#
++# For use Wildcard SSL certificete in private network.
++#wildcard-domain=example.com
+diff -Naur /original/dnsmasq-2.80/src/dnsmasq.h /gitmasa/dnsmasq/src/dnsmasq.h
+--- /original/dnsmasq-2.80/src/dnsmasq.h	2018-10-19 03:21:55.000000000 +0900
++++ /gitmasa/dnsmasq/src/dnsmasq.h	2019-02-07 18:11:02.459139217 +0900
+@@ -1057,6 +1057,7 @@
+   unsigned char *duid_config;
+   char *dbus_name;
+   char *dump_file;
++  char *wildcard_domain;
+   int dump_mask;
+   unsigned long soa_sn, soa_refresh, soa_retry, soa_expiry;
+   u32 metrics[__METRIC_MAX];
+@@ -1262,6 +1263,8 @@
+ int sockaddr_isequal(union mysockaddr *s1, union mysockaddr *s2);
+ int hostname_isequal(const char *a, const char *b);
+ int hostname_issubdomain(char *a, char *b);
++int hostname_get_subdomain(char *domain, char *target, char *dst);
++int convert_wildcard_subdomain_to_ipv4(char *subdomain);
+ time_t dnsmasq_time(void);
+ int netmask_length(struct in_addr mask);
+ int is_same_net(struct in_addr a, struct in_addr b, struct in_addr mask);
+diff -Naur /original/dnsmasq-2.80/src/option.c /gitmasa/dnsmasq/src/option.c
+--- /original/dnsmasq-2.80/src/option.c	2018-10-19 03:21:55.000000000 +0900
++++ /gitmasa/dnsmasq/src/option.c	2019-02-07 18:09:07.723949351 +0900
+@@ -166,7 +166,8 @@
+ #define LOPT_UBUS          354
+ #define LOPT_NAME_MATCH    355
+ #define LOPT_CAA           356
+- 
++#define LOPT_WCARD_DOMAIN  357
++
+ #ifdef HAVE_GETOPT_LONG
+ static const struct option opts[] =  
+ #else
+@@ -337,6 +338,7 @@
+     { "dhcp-rapid-commit", 0, 0, LOPT_RAPID_COMMIT },
+     { "dumpfile", 1, 0, LOPT_DUMPFILE },
+     { "dumpmask", 1, 0, LOPT_DUMPMASK },
++    { "wildcard-domain", 1, 0, LOPT_WCARD_DOMAIN },
+     { NULL, 0, 0, 0 }
+   };
+ 
+@@ -515,6 +517,7 @@
+   { LOPT_RAPID_COMMIT, OPT_RAPID_COMMIT, NULL, gettext_noop("Enables DHCPv4 Rapid Commit option."), NULL },
+   { LOPT_DUMPFILE, ARG_ONE, "<path>", gettext_noop("Path to debug packet dump file"), NULL },
+   { LOPT_DUMPMASK, ARG_ONE, "<hex>", gettext_noop("Mask which packets to dump"), NULL },
++  { LOPT_WCARD_DOMAIN, ARG_ONE, "<host_name>", gettext_noop("Specify an private network wildcard host."), NULL },
+   { 0, 0, NULL, NULL, NULL }
+ }; 
+ 
+@@ -1820,7 +1823,10 @@
+ 	new->weight = pref;
+ 	break;
+       }
+-      
++    case LOPT_WCARD_DOMAIN:  /* --wildcard-domain */
++      daemon->wildcard_domain = opt_string_alloc(arg);
++      break;
++
+     case 't': /*  --mx-target */
+       if (!(daemon->mxtarget = canonicalise_opt(arg)))
+ 	ret_err(_("bad MX target"));
+diff -Naur /original/dnsmasq-2.80/src/rfc1035.c /gitmasa/dnsmasq/src/rfc1035.c
+--- /original/dnsmasq-2.80/src/rfc1035.c	2018-10-19 03:21:55.000000000 +0900
++++ /gitmasa/dnsmasq/src/rfc1035.c	2019-02-07 18:13:04.634276784 +0900
+@@ -1745,6 +1745,31 @@
+ 		}
+ 	    }
+ 
++    if (daemon->wildcard_domain) {
++      char subdomainPart[strlen(name)+1];
++      if ((qtype == T_ANY || qtype == T_A) && hostname_get_subdomain(daemon->wildcard_domain, name, subdomainPart) == 1) {
++        if (convert_wildcard_subdomain_to_ipv4(subdomainPart) == 1) {
++          struct all_addr tmpAddr;
++          if (inet_pton(AF_INET, subdomainPart, &tmpAddr) == 1) {
++            struct crec *tmpCrec;
++            if ((tmpCrec = whine_malloc(SIZEOF_BARE_CREC + strlen(name) + 1))) {
++              strcpy(tmpCrec->name.sname, name);
++              tmpCrec->flags = 205; // 205:normal 333:loopback
++              tmpCrec->ttd = 0; // 0
++              log_query(tmpCrec->flags & ~F_REVERSE, name, &tmpAddr, record_source(tmpCrec->uid));
++              ans = 1;
++              if (add_resource_record(header, limit, &trunc, nameoffset, &ansp,
++                                      crec_ttl(tmpCrec, now), NULL, T_A, C_IN,
++                                      "4", &tmpAddr)) {
++                anscount++;
++              }
++            }
++
++          }
++        }
++      }
++    }
++
+ 	  if (qtype == T_CNAME || qtype == T_ANY)
+ 	    {
+ 	      if ((crecp = cache_find_by_name(NULL, name, now, F_CNAME | (dryrun ? F_NO_RR : 0))) &&
+diff -Naur /original/dnsmasq-2.80/src/util.c /gitmasa/dnsmasq/src/util.c
+--- /original/dnsmasq-2.80/src/util.c	2018-10-19 03:21:55.000000000 +0900
++++ /gitmasa/dnsmasq/src/util.c	2019-02-07 18:09:44.927686632 +0900
+@@ -402,8 +402,81 @@
+ 
+   return 0;
+ }
+- 
+-  
++
++/* get subdomain part */
++int hostname_get_subdomain(char *domain, char *target, char *dst)
++{
++  char *ap, *bp;
++  unsigned int c1, c2;
++
++  /* move to the end */
++  for (ap = domain; *ap; ap++);
++  for (bp = target; *bp; bp++);
++
++  /* a shorter than b or a empty. */
++  if ((bp - target) < (ap - domain) || ap == domain)
++    return 0;
++
++  do
++  {
++    c1 = (unsigned char) *(--ap);
++    c2 = (unsigned char) *(--bp);
++
++    if (c1 >= 'A' && c1 <= 'Z')
++      c1 += 'a' - 'A';
++    if (c2 >= 'A' && c2 <= 'Z')
++      c2 += 'a' - 'A';
++
++    if (c1 != c2)
++      return 0;
++  } while (ap != domain);
++
++  if (*(--bp) != '.')
++    return 0;
++
++  safe_strncpy(dst, target, bp-target+1);
++  dst[bp-target+1] = '\0';
++  return 1;
++}
++
++
++/* convert from formatted string value[aaaa-***_***_***_***] ex.[http-192_168_0_2] */
++int convert_wildcard_subdomain_to_ipv4(char *subdomain)
++{
++  char *ap, *endp;
++  char buff[strlen(subdomain)+1];
++
++  /* move to the end */
++  for (ap = subdomain; *ap; ap++) {
++    if (*ap == '_') {
++      *ap = '.';
++    }
++  }
++  endp = ap;
++  int dotCnt = 0;
++  do
++  {
++    ap--;
++    if (*ap == '.') {
++      dotCnt++;
++    }
++    else if (dotCnt == 3 && *ap == '-') {
++      dotCnt++;
++    }
++  } while (dotCnt <= 3 && ap != subdomain);
++  if (dotCnt < 3) {
++    return 0;
++  }
++  if (*ap == '.' || *ap == '-') {
++    ap++;
++  }
++  safe_strncpy(buff, ap, endp-ap+1);
++  safe_strncpy(subdomain, buff, endp-ap+1);
++  subdomain[endp-ap+1] = '\0';
++  return 1;
++
++}
++
+ time_t dnsmasq_time(void)
+ {
+ #ifdef HAVE_BROKEN_RTC
