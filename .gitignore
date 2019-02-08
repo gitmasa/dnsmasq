@@ -1,1 +1,8 @@
 .idea
+src/*.mo
+src/*.pot
+src/*.o
+src/dnsmasq.a
+src/dnsmasq
+src/.copts_*
+src/dnsmasq_baseline
